@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from pathlib import Path
+
 
 # =============================================================================
 # Geometry
@@ -791,6 +793,131 @@ def link_figures_to_captions(doc: Any, config: Optional[LinkerConfig] = None) ->
 
     return DoclingFigureCaptionLinker(config=config).link(doc)
 
+# =============================================================================
+def render_picture(
+        picitem: PictureItem, 
+        pdf: fitz.Document,
+        zoom:int = 2
+    ) -> fitz.Pixmap:
+    """
+    Render a cropped image from a PDF page based on a Docling PictureItem.
+    This function extracts the region of a PDF corresponding to the bounding box stored in a PictureItem 
+    and renders it as a raster image.
+    Args:
+        picitem (PictureItem):
+            A Docling PictureItem containing provenance data with page number and bounding box coordinates.
+        pdf (fitz.Document):
+            An open PyMuPDF PDF document.
+        zoom (int, optional):
+            Scaling factor for rendering resolution. Default is 2.0.
+    Returns:
+        fitz.Pixmap:
+            A rasterized image (Pixmap) of the clipped region.
+    """
+    # Convert 1-based page number → 0-based
+    page_no = picitem.prov[0].page_no - 1
+    page = pdf[page_no]
+    
+    bbox = picitem.prov[0].bbox
+    page_height = page.rect.height
+
+    # Coordinate transform (BOTTOMLEFT → TOPLEFT)
+    x0 = bbox.l
+    x1 = bbox.r
+    y0 = page_height - bbox.t
+    y1 = page_height - bbox.b
+
+    rect = fitz.Rect(x0, y0, x1, y1)
+
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, clip=rect)
+
+    return pix
+
+def get_caption(picitem, docdict):
+    texts = []
+    for child in picitem.children:
+        idx = int(child.cref.split('/')[-1])
+        # texts.append(docdict['texts'][idx]['text'])  # TypeError: 'TextItem' object is not subscriptable
+        texts.append(docdict['texts'][idx].text)
+    return " ".join(texts)
+
+def save_page_figure_images_and_captions(
+    doc,
+    pdf: fitz.Document,
+    page_no: int,
+    output_dir: str = "figure_exports",
+    zoom: int = 2,
+):
+    """
+    Save only figures from a specific page as:
+        figure_xxxx.png
+        figure_xxxx.txt
+    """
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Your robust linker output
+    associations = extract_figure_caption_map(doc)
+
+    # Lookup by figure ref
+    assoc_map = {
+        row["figure_ref"]: row
+        for row in associations
+    }
+
+    saved_count = 0
+
+    for idx, picitem in enumerate(doc.pictures):
+
+        # Skip figures not on requested page
+        if not picitem.prov:
+            continue
+
+        pic_page = picitem.prov[0].page_no
+
+        if pic_page != page_no:
+            continue
+
+        fig_ref = str(picitem.self_ref)
+
+        # ----------------------------
+        # Render image
+        # ----------------------------
+        pix = render_picture(picitem, pdf, zoom=zoom)
+
+        image_filename = f"page_{page_no}_figure_{saved_count:04d}.png"
+        image_path = output_path / image_filename
+
+        pix.save(str(image_path))
+
+        # ----------------------------
+        # Caption lookup
+        # ----------------------------
+        assoc = assoc_map.get(fig_ref, {})
+
+        caption = assoc.get("caption_text")
+
+        if not caption:
+            caption = "[No caption found]"
+
+        # ----------------------------
+        # Save caption txt
+        # ----------------------------
+        txt_filename = f"page_{page_no}_figure_{saved_count:04d}.txt"
+        txt_path = output_path / txt_filename
+
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(caption)
+
+        print(f"Saved:")
+        print(f"  Image   : {image_path}")
+        print(f"  Caption : {txt_path}")
+        print()
+
+        saved_count += 1
+# =============================================================================
 
 def extract_figure_caption_map(doc: Any, config: Optional[LinkerConfig] = None) -> List[Dict[str, Any]]:
     """Convenience wrapper that returns JSON-friendly dictionaries."""
@@ -803,15 +930,85 @@ def extract_figure_caption_map(doc: Any, config: Optional[LinkerConfig] = None) 
 # Example usage
 # =============================================================================
 
+# if __name__ == "__main__":
+#     # Example only.
+#     #
+#     from docling.document_converter import DocumentConverter
+
+#     data_folder_path = Path("/mnt/c/Users/Rakesh-PC/Documents/1_GitHubSync_SSH/iid-platform/sample_data/named")
+#     file_path = data_folder_path / "govt-food-data-report-large-table-heavy.pdf"
+
+#     converter = DocumentConverter()
+#     result = converter.convert(file_path)
+#     doc = result.document
+#     #
+#     pairs = extract_figure_caption_map(doc)
+#     for row in pairs:
+#         print(row)
+#     pass
+
+# ----------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    # Example only.
-    #
-    # from docling.document_converter import DocumentConverter
-    # converter = DocumentConverter()
-    # result = converter.convert(file_path)
-    # doc = result.document
-    #
-    # pairs = extract_figure_caption_map(doc)
-    # for row in pairs:
-    #     print(row)
-    pass
+
+    import time
+    import fitz
+
+    from docling.document_converter import DocumentConverter
+
+    data_folder_path = Path(
+        "/mnt/c/Users/Rakesh-PC/Documents/1_GitHubSync_SSH/iid-platform/sample_data/named"
+    )
+
+    file_path = data_folder_path / "govt-food-data-report-large-table-heavy.pdf"
+
+    # =========================================================
+    # TOTAL TIMER
+    # =========================================================
+    total_start = time.perf_counter()
+
+    # =========================================================
+    # DOCUMENT CONVERSION TIMER
+    # =========================================================
+    convert_start = time.perf_counter()
+
+    converter = DocumentConverter()
+    result = converter.convert(file_path)
+
+    doc = result.document
+
+    convert_end = time.perf_counter()
+
+    print(f"\nDocument conversion took: "
+          f"{convert_end - convert_start:.2f} seconds")
+
+    # =========================================================
+    # OPEN PDF
+    # =========================================================
+    fitz_pdf = fitz.open(file_path)
+
+    # =========================================================
+    # FIGURE + CAPTION EXPORT TIMER
+    # =========================================================
+    export_start = time.perf_counter()
+
+    save_page_figure_images_and_captions(
+        doc,
+        fitz_pdf,
+        page_no=480,
+        output_dir="exports_page_480",
+        zoom=3,
+    )
+
+    export_end = time.perf_counter()
+
+    print(f"\nFigure/caption export took: "
+          f"{export_end - export_start:.2f} seconds")
+
+    # =========================================================
+    # TOTAL TIME
+    # =========================================================
+    total_end = time.perf_counter()
+
+    print(f"\nTOTAL PIPELINE TIME: "
+          f"{total_end - total_start:.2f} seconds")
