@@ -7,3 +7,5 @@ __pycache__/
 
 # Custom generated temp files and folders
 *.temp/
+*temp.json
+*exports_page_*/
