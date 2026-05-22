@@ -960,7 +960,8 @@ if __name__ == "__main__":
         "/mnt/c/Users/Rakesh-PC/Documents/1_GitHubSync_SSH/iid-platform/sample_data/named"
     )
 
-    file_path = data_folder_path / "govt-food-data-report-large-table-heavy.pdf"
+    # file_path = data_folder_path / "govt-food-data-report-large-table-heavy.pdf"
+    file_path = data_folder_path / "nature-alberta-spring-2026-magazine-medium-mix-multi-col-text.pdf"
 
     # =========================================================
     # TOTAL TIMER
@@ -995,8 +996,9 @@ if __name__ == "__main__":
     save_page_figure_images_and_captions(
         doc,
         fitz_pdf,
-        page_no=480,
-        output_dir="exports_page_480",
+        # page_no=480,
+        page_no=10,
+        output_dir="exports_page_10",
         zoom=3,
     )
 
