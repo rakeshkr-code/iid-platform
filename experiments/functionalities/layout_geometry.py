@@ -24,9 +24,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from statistics import median
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
 
 from pathlib import Path
+
+import io
+import sys
+import time
+import fitz
+from PIL import Image
+from IPython.display import display
 
 
 # =============================================================================
@@ -842,36 +849,86 @@ def get_caption(picitem, docdict):
         texts.append(docdict['texts'][idx].text)
     return " ".join(texts)
 
-def save_page_figure_images_and_captions(
+def export_page_figures(
     doc,
     pdf: fitz.Document,
     page_no: int,
     output_dir: str = "figure_exports",
     zoom: int = 2,
-):
+    mode: Literal["display", "save", "both"] = "display",
+    show_caption: bool = True,
+    save_caption_txt: bool = True,
+    ) -> None:
     """
-    Save only figures from a specific page as:
-        figure_xxxx.png
-        figure_xxxx.txt
+    Display and/or save figures with captions from a specific PDF page.
+
+    Figures are rendered from the source PDF using Docling picture
+    provenance metadata. Captions are resolved using the figure-caption
+    linker output.
+
+    Args:
+        doc:
+            Parsed Docling document.
+
+        pdf (fitz.Document):
+            Open PyMuPDF document.
+
+        page_no (int):
+            1-based page number to process.
+
+        output_dir (str, optional):
+            Directory used when saving outputs.
+
+        zoom (int, optional):
+            Rendering scale factor.
+
+        mode (Literal["display", "save", "both"], optional):
+            Output behavior:
+            - "display": show inline in notebook
+            - "save": save to disk
+            - "both": display and save
+
+        show_caption (bool, optional):
+            Print captions during display.
+
+        save_caption_txt (bool, optional):
+            Save captions as `.txt` files in save mode.
+
+    Returns:
+        None
     """
+
+    # ---------------------------------------------------------
+    # Prepare output directory if saving is enabled
+    # ---------------------------------------------------------
+
+    save_enabled = mode in {"save", "both"}
+    display_enabled = mode in {"display", "both"}
 
     output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
 
-    # Your robust linker output
+    if save_enabled:
+        output_path.mkdir(parents=True, exist_ok=True)
+
+    # ---------------------------------------------------------
+    # Figure-caption associations
+    # ---------------------------------------------------------
+
     associations = extract_figure_caption_map(doc)
 
-    # Lookup by figure ref
     assoc_map = {
         row["figure_ref"]: row
         for row in associations
     }
 
-    saved_count = 0
+    exported_count = 0
 
-    for idx, picitem in enumerate(doc.pictures):
+    # ---------------------------------------------------------
+    # Iterate figures
+    # ---------------------------------------------------------
 
-        # Skip figures not on requested page
+    for picitem in doc.pictures:
+
         if not picitem.prov:
             continue
 
@@ -882,19 +939,20 @@ def save_page_figure_images_and_captions(
 
         fig_ref = str(picitem.self_ref)
 
-        # ----------------------------
+        # -----------------------------------------------------
         # Render image
-        # ----------------------------
-        pix = render_picture(picitem, pdf, zoom=zoom)
+        # -----------------------------------------------------
 
-        image_filename = f"page_{page_no}_figure_{saved_count:04d}.png"
-        image_path = output_path / image_filename
+        pix = render_picture(
+            picitem=picitem,
+            pdf=pdf,
+            zoom=zoom,
+        )
 
-        pix.save(str(image_path))
+        # -----------------------------------------------------
+        # Lookup caption
+        # -----------------------------------------------------
 
-        # ----------------------------
-        # Caption lookup
-        # ----------------------------
         assoc = assoc_map.get(fig_ref, {})
 
         caption = assoc.get("caption_text")
@@ -902,21 +960,61 @@ def save_page_figure_images_and_captions(
         if not caption:
             caption = "[No caption found]"
 
-        # ----------------------------
-        # Save caption txt
-        # ----------------------------
-        txt_filename = f"page_{page_no}_figure_{saved_count:04d}.txt"
-        txt_path = output_path / txt_filename
+        # -----------------------------------------------------
+        # DISPLAY MODE
+        # -----------------------------------------------------
 
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(caption)
+        if display_enabled:
 
-        print(f"Saved:")
-        print(f"  Image   : {image_path}")
-        print(f"  Caption : {txt_path}")
-        print()
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
 
-        saved_count += 1
+            if "ipykernel" in sys.modules:
+                display(img)      # notebook
+            else:
+                img.show()        # normal .py script
+
+            print(f"Figure Ref : {fig_ref}")
+
+            if show_caption:
+                print(f"Caption    : {caption}")
+
+            print()
+
+        # -----------------------------------------------------
+        # SAVE MODE
+        # -----------------------------------------------------
+
+        if save_enabled:
+
+            image_filename = (
+                f"page_{page_no}_figure_{exported_count:04d}.png"
+            )
+
+            image_path = output_path / image_filename
+
+            pix.save(str(image_path))
+
+            print(f"Saved image: {image_path}")
+
+            if save_caption_txt:
+
+                txt_filename = (
+                    f"page_{page_no}_figure_{exported_count:04d}.txt"
+                )
+
+                txt_path = output_path / txt_filename
+
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(caption)
+
+                print(f"Saved text : {txt_path}")
+
+            print()
+
+        exported_count += 1
+
+    print(f"Processed {exported_count} figure(s) from page {page_no}.")
+
 # =============================================================================
 
 def extract_figure_caption_map(doc: Any, config: Optional[LinkerConfig] = None) -> List[Dict[str, Any]]:
@@ -993,13 +1091,12 @@ if __name__ == "__main__":
     # =========================================================
     export_start = time.perf_counter()
 
-    save_page_figure_images_and_captions(
+    export_page_figures(
         doc,
         fitz_pdf,
-        # page_no=480,
         page_no=10,
-        output_dir="exports_page_10",
         zoom=3,
+        mode="display",
     )
 
     export_end = time.perf_counter()
