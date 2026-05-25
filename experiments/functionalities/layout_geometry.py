@@ -482,15 +482,14 @@ class DoclingFigureCaptionLinker:
         figures: Sequence[PageFigure],
         caption_clusters: Sequence[CaptionCluster],
     ) -> List[CaptionAssociation]:
-        """Link figures to caption clusters on a single page."""
-
         used_caption_refs: set[str] = set()
         results: List[CaptionAssociation] = []
 
-        # First pass: direct Docling links.
         for fig in figures:
             direct = self._direct_caption_for_figure(fig.raw, caption_clusters)
-            if direct is not None:
+
+            # Current behavior: trust Docling's own link.
+            if self.config.trust_docling_direct_links and direct is not None:
                 results.append(
                     CaptionAssociation(
                         figure_ref=fig.ref,
@@ -504,12 +503,9 @@ class DoclingFigureCaptionLinker:
                     )
                 )
                 used_caption_refs.update(direct.refs)
-
-        # Second pass: geometry-based matching.
-        for fig in figures:
-            if any(r.figure_ref == fig.ref for r in results):
                 continue
 
+            # New behavior: even if Docling direct link exists, still search best caption cluster.
             best = self._best_caption_candidate(fig, caption_clusters, used_caption_refs, figures)
             if best is None:
                 results.append(
