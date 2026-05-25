@@ -856,6 +856,7 @@ def export_page_figures(
     mode: Literal["display", "save", "both"] = "display",
     show_caption: bool = True,
     save_caption_txt: bool = True,
+    config: Optional[LinkerConfig] = None,
     ) -> None:
     """
     Display and/or save figures with captions from a specific PDF page.
@@ -912,7 +913,7 @@ def export_page_figures(
     # Figure-caption associations
     # ---------------------------------------------------------
 
-    associations = extract_figure_caption_map(doc)
+    associations = extract_figure_caption_map(doc, config=config)
 
     assoc_map = {
         row["figure_ref"]: row
