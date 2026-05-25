@@ -181,6 +181,8 @@ class CaptionAssociation:
 class LinkerConfig:
     """Tunable thresholds for figure-caption linking."""
 
+    trust_docling_direct_links: bool = True
+
     # Figure-caption distance thresholds in normalized page coordinates.
     max_below_gap: float = 180.0
     max_above_gap: float = 140.0
