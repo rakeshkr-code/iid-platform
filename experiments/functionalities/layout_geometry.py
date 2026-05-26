@@ -8,14 +8,16 @@ stable association between pictures and their captions across messy PDF layouts:
 - captions wider than the figure
 - captions split across multiple text blocks
 - figures with missing or partial Docling caption links
+- side captions and directional panel captions (Above/Below/Left/Right)
 
 Core idea
 ---------
-1. Trust Docling's direct caption links first.
+1. Use Docling's direct caption links as a policy choice (trust / boost / ignore).
 2. Normalize every bbox into a single internal coordinate system.
 3. Merge nearby caption-like text blocks into candidate caption clusters.
-4. Score candidate figure/caption pairs using geometry + layout blockers.
-5. Be conservative: prefer "unmatched" over a wrong match.
+4. Treat directional text atoms (Above/Below/Left/Right/Top/Bottom) separately.
+5. Score candidate figure/caption pairs using geometry + layout blockers.
+6. Be conservative: prefer "unmatched" over a wrong match.
 
 This code is dependency-free apart from Docling's document objects.
 """
@@ -23,14 +25,15 @@ This code is dependency-free apart from Docling's document objects.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from statistics import median
 from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
 
 from pathlib import Path
 
 import io
+import re
 import sys
 import time
+
 import fitz
 from PIL import Image
 from IPython.display import display
@@ -73,12 +76,10 @@ class Rect:
 
     @property
     def cx(self) -> float:
-        """X-axis center of the rectangle."""
         return (self.left + self.right) / 2.0
 
     @property
     def cy(self) -> float:
-        """Y-axis center of the rectangle."""
         return (self.top + self.bottom) / 2.0
 
     def expand(self, dx: float, dy: float) -> "Rect":
@@ -99,17 +100,18 @@ class Rect:
         return self.x_overlap(other) * self.y_overlap(other)
 
     def horizontal_overlap_ratio(self, other: "Rect") -> float:
-        """Horizontal overlap divided by the smaller width.
-
-        This is more permissive than exact edge equality and works well for
-        captions that are slightly wider than the figure.
-        """
-
         denom = max(1e-9, min(self.width, other.width))
         return self.x_overlap(other) / denom
 
+    def vertical_overlap_ratio(self, other: "Rect") -> float:
+        denom = max(1e-9, min(self.height, other.height))
+        return self.y_overlap(other) / denom
+
     def contains_x(self, x: float) -> bool:
         return self.left <= x <= self.right
+
+    def contains_y(self, y: float) -> bool:
+        return self.top <= y <= self.bottom
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,31 @@ class PageFigure:
     page_no: int
     bbox: Rect
     raw: Any
+
+
+_DIRECTION_RE = re.compile(r"^\s*(above|below|left|right|top|bottom)\s*[:\-\u2014]?\s*", re.IGNORECASE)
+_DIRECTION_ALIAS = {"top": "above", "bottom": "below"}
+_DIRECTION_TO_CAPTION_RELATION = {
+    # text says "Above:" -> the figure is above the text, so caption/cluster is below the figure
+    "above": "below",
+    # text says "Below:" -> the figure is below the text, so caption/cluster is above the figure
+    "below": "above",
+    # text says "Left:" -> the figure is left of the text, so caption/cluster is right of the figure
+    "left": "right",
+    # text says "Right:" -> the figure is right of the text, so caption/cluster is left of the figure
+    "right": "left",
+}
+
+
+def _direction_hint_from_text(text: str) -> Optional[str]:
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = _DIRECTION_RE.match(t)
+    if not m:
+        return None
+    key = m.group(1).lower()
+    return _DIRECTION_ALIAS.get(key, key)
 
 
 @dataclass(frozen=True)
@@ -134,6 +161,14 @@ class PageText:
     raw: Any
 
     @property
+    def direction_hint(self) -> Optional[str]:
+        return _direction_hint_from_text(self.text)
+
+    @property
+    def is_directional_atom(self) -> bool:
+        return self.direction_hint is not None
+
+    @property
     def is_caption_like(self) -> bool:
         """Return True for explicit captions and caption-like fallback text."""
 
@@ -142,7 +177,8 @@ class PageText:
             return False
         if self.label.lower() == "caption":
             return True
-        # Conservative fallback for mis-labeled captions.
+        if self.is_directional_atom:
+            return True
         prefixes = ("fig", "figure", "plate", "photo", "pic", "image")
         return t[:8].strip().lower().startswith(prefixes)
 
@@ -157,10 +193,16 @@ class CaptionCluster:
     text: str
     labels: Tuple[str, ...]
     raw_items: Tuple[Any, ...]
+    kind: Literal["normal", "directional"] = "normal"
+    direction_hint: Optional[str] = None
 
     @property
     def is_explicit_caption(self) -> bool:
-        return any(lbl.lower() == "caption" for lbl in self.labels)
+        return self.kind == "normal" and any(lbl.lower() == "caption" for lbl in self.labels)
+
+    @property
+    def is_directional(self) -> bool:
+        return self.kind == "directional"
 
 
 @dataclass(frozen=True)
@@ -181,25 +223,32 @@ class CaptionAssociation:
 class LinkerConfig:
     """Tunable thresholds for figure-caption linking."""
 
-    trust_docling_direct_links: bool = True
+    direct_link_policy: Literal["trust", "boost", "ignore"] = "boost"
 
     # Figure-caption distance thresholds in normalized page coordinates.
     max_below_gap: float = 180.0
     max_above_gap: float = 140.0
+    max_left_gap: float = 180.0
+    max_right_gap: float = 180.0
 
-    # Minimum horizontal alignment signal.
+    # Minimum horizontal / vertical alignment signals.
     min_horizontal_overlap_ratio: float = 0.08
+    min_vertical_overlap_ratio: float = 0.08
     max_center_dx_ratio: float = 0.55
+    max_center_dy_ratio: float = 0.55
 
-    # Expand figure x-span to support wider captions in asymmetric layouts.
+    # Expand figure span to support wider captions in asymmetric layouts.
     figure_expand_x_ratio: float = 0.20
     figure_expand_x_min: float = 10.0
+    figure_expand_y_ratio: float = 0.20
+    figure_expand_y_min: float = 10.0
 
     # Small tolerance to cope with OCR/layout jitter.
     vertical_tolerance: float = 4.0
 
-    # Direct Docling caption links get first priority.
+    # Direct Docling caption links get priority.
     direct_caption_bonus: float = 10_000.0
+    directional_caption_bonus: float = 60.0
     caption_label_bonus: float = 80.0
 
     # Penalize very long captions only slightly.
@@ -211,6 +260,10 @@ class LinkerConfig:
 
     # Prevent a caption from crossing through another figure lane.
     blocker_penalty: float = 35.0
+
+    # Page mode routing.
+    panel_mode_min_figures: int = 3
+    panel_mode_min_directionals: int = 2
 
 
 # =============================================================================
@@ -263,14 +316,7 @@ def _page_size_map(doc: Any) -> Dict[int, float]:
 
 
 def _raw_bbox_to_rect(bbox: Any, page_height: Optional[float]) -> Rect:
-    """Normalize a Docling bbox into the internal top-left coordinate system.
-
-    Docling provenance may come from PDFs with `CoordOrigin.BOTTOMLEFT` or other
-    origins. When page height is known, we transform everything to a top-left
-    system (`y` increases downward) so layout logic stays consistent.
-
-    If page height is unavailable, we fall back to min/max normalization.
-    """
+    """Normalize a Docling bbox into the internal top-left coordinate system."""
 
     def _get(obj: Any, *names: str) -> float:
         for name in names:
@@ -288,25 +334,15 @@ def _raw_bbox_to_rect(bbox: Any, page_height: Optional[float]) -> Rect:
     left = min(l, r)
     right = max(l, r)
 
-    # Try to detect coordinate origin from the bbox if available.
-    coord_origin = None
-    if hasattr(bbox, "coord_origin"):
-        coord_origin = str(getattr(bbox, "coord_origin"))
-    elif isinstance(bbox, Mapping) and "coord_origin" in bbox:
-        coord_origin = str(bbox["coord_origin"])
-
-    # With a known page height, convert all y-values to top-left coordinates.
+    # With a known page height, convert bottom-left provenance to top-left.
     if page_height is not None:
-        # In bottom-left PDF coordinates, larger raw y is visually higher.
-        # Mapping to top-left is done by y' = page_height - y.
-        # This also works safely for most mixed provenance cases.
         y1 = page_height - max(t, b)
         y2 = page_height - min(t, b)
         top = min(y1, y2)
         bottom = max(y1, y2)
         return Rect(left=left, top=top, right=right, bottom=bottom)
 
-    # Fallback: assume numeric labels are already usable and just sort them.
+    # Fallback: assume values are already usable and just sort them.
     top = min(t, b)
     bottom = max(t, b)
     return Rect(left=left, top=top, right=right, bottom=bottom)
@@ -334,16 +370,7 @@ def _text_block_signature(rect: Rect) -> Tuple[float, float, float]:
 
 
 class DoclingFigureCaptionLinker:
-    """Conservative figure-caption linker for Docling documents.
-
-    The linker uses a two-stage strategy:
-
-    1. Use Docling's own figure->caption links when they exist.
-    2. For unlinked figures, search the same page for the best caption cluster.
-
-    The output is intentionally clean and page-aware so it can be serialized into
-    a metadata store or used as part of a downstream RAG ingestion pipeline.
-    """
+    """Conservative figure-caption linker for Docling documents."""
 
     def __init__(self, config: Optional[LinkerConfig] = None) -> None:
         self.config = config or LinkerConfig()
@@ -369,7 +396,7 @@ class DoclingFigureCaptionLinker:
         for page_no in sorted(figures_by_page):
             page_figures = sorted(figures_by_page[page_no], key=lambda x: (x.bbox.top, x.bbox.left))
             page_texts = texts_by_page.get(page_no, [])
-            caption_clusters = self._build_caption_clusters(page_texts)
+            caption_clusters = self._build_caption_clusters(page_figures, page_texts)
             results.extend(self._link_page(page_no, page_figures, caption_clusters))
         return results
 
@@ -428,30 +455,69 @@ class DoclingFigureCaptionLinker:
         return figures, texts
 
     # ------------------------------------------------------------------
+    # Page routing
+    # ------------------------------------------------------------------
+
+    def _page_layout_mode(self, figures: Sequence[PageFigure], caption_clusters: Sequence[CaptionCluster]) -> Literal["local", "panel"]:
+        cfg = self.config
+        n_fig = len(figures)
+        n_dir = sum(1 for c in caption_clusters if c.is_directional)
+        n_norm = sum(1 for c in caption_clusters if not c.is_directional)
+
+        if n_fig >= cfg.panel_mode_min_figures and n_dir >= cfg.panel_mode_min_directionals:
+            return "panel"
+        if n_fig >= 2 and n_dir > 0 and n_norm > 0:
+            return "panel"
+        return "local"
+
+    # ------------------------------------------------------------------
     # Caption clustering
     # ------------------------------------------------------------------
 
-    def _build_caption_clusters(self, texts: Sequence[PageText]) -> List[CaptionCluster]:
-        """Merge adjacent caption-like text blocks into caption clusters.
+    def _is_loose_caption_candidate(self, txt: PageText, figures: Sequence[PageFigure]) -> bool:
+        """Promote some non-caption-labeled text blocks if they are close to a figure."""
 
-        This matters when a single caption is split into multiple text items by the
-        layout model or OCR.
-        """
+        t = txt.text.strip()
+        if not t:
+            return False
+        if txt.is_directional_atom:
+            return True
+        if txt.label.lower() == "caption":
+            return True
+
+        # Keep this conservative but not too narrow. This is what lets plain TEXT
+        # blocks like figure captions (with normal sentences) still enter the pool.
+        if len(t) < 20 or len(t) > 280:
+            return False
+
+        return any(
+            self._is_plausible_below(fig.bbox, txt.bbox)
+            or self._is_plausible_above(fig.bbox, txt.bbox)
+            or self._is_plausible_left(fig.bbox, txt.bbox)
+            or self._is_plausible_right(fig.bbox, txt.bbox)
+            for fig in figures
+        )
+
+    def _build_caption_clusters(self, figures: Sequence[PageFigure], texts: Sequence[PageText]) -> List[CaptionCluster]:
+        """Merge adjacent caption-like blocks into clusters and keep directional atoms as singletons."""
 
         cfg = self.config
-        candidates = [t for t in texts if t.is_caption_like]
+
+        candidates = [t for t in texts if t.is_caption_like or self._is_loose_caption_candidate(t, figures)]
         if not candidates:
             return []
 
+        normal_candidates = [t for t in candidates if not t.is_directional_atom]
+        directional_atoms = [t for t in candidates if t.is_directional_atom]
+
         # Sort top-to-bottom, then left-to-right.
-        candidates = sorted(candidates, key=lambda t: (t.bbox.top, t.bbox.left, t.bbox.right))
+        normal_candidates = sorted(normal_candidates, key=lambda t: (t.bbox.top, t.bbox.left, t.bbox.right))
         clusters: List[List[PageText]] = []
 
-        for txt in candidates:
+        for txt in normal_candidates:
             placed = False
             for cluster in clusters:
                 last = cluster[-1]
-                # Same page, close vertically, and reasonably aligned in X.
                 vertical_gap = txt.bbox.top - last.bbox.bottom
                 same_lane = last.bbox.horizontal_overlap_ratio(txt.bbox) >= cfg.cluster_x_overlap_ratio
                 if 0.0 <= vertical_gap <= cfg.cluster_vertical_gap and same_lane:
@@ -468,8 +534,34 @@ class DoclingFigureCaptionLinker:
             labels = tuple(t.label for t in cluster)
             raw_items = tuple(t.raw for t in cluster)
             text = " ".join(t.text.strip() for t in cluster if t.text.strip()).strip()
-            merged.append(CaptionCluster(refs=refs, page_no=cluster[0].page_no, bbox=bbox, text=text, labels=labels, raw_items=raw_items))
+            merged.append(
+                CaptionCluster(
+                    refs=refs,
+                    page_no=cluster[0].page_no,
+                    bbox=bbox,
+                    text=text,
+                    labels=labels,
+                    raw_items=raw_items,
+                    kind="normal",
+                    direction_hint=None,
+                )
+            )
 
+        for txt in directional_atoms:
+            merged.append(
+                CaptionCluster(
+                    refs=(txt.ref,),
+                    page_no=txt.page_no,
+                    bbox=txt.bbox,
+                    text=txt.text.strip(),
+                    labels=(txt.label,),
+                    raw_items=(txt.raw,),
+                    kind="directional",
+                    direction_hint=txt.direction_hint,
+                )
+            )
+
+        merged.sort(key=lambda c: (c.bbox.top, c.bbox.left, c.bbox.right))
         return merged
 
     # ------------------------------------------------------------------
@@ -482,14 +574,26 @@ class DoclingFigureCaptionLinker:
         figures: Sequence[PageFigure],
         caption_clusters: Sequence[CaptionCluster],
     ) -> List[CaptionAssociation]:
+        mode = self._page_layout_mode(figures, caption_clusters)
+        if mode == "panel":
+            return self._link_page_panel(page_no, figures, caption_clusters)
+        return self._link_page_local(page_no, figures, caption_clusters)
+
+    def _link_page_local(
+        self,
+        page_no: int,
+        figures: Sequence[PageFigure],
+        caption_clusters: Sequence[CaptionCluster],
+    ) -> List[CaptionAssociation]:
+        """Fast path for ordinary pages."""
+
         used_caption_refs: set[str] = set()
         results: List[CaptionAssociation] = []
 
         for fig in figures:
             direct = self._direct_caption_for_figure(fig.raw, caption_clusters)
 
-            # Current behavior: trust Docling's own link.
-            if self.config.trust_docling_direct_links and direct is not None:
+            if self.config.direct_link_policy == "trust" and direct is not None:
                 results.append(
                     CaptionAssociation(
                         figure_ref=fig.ref,
@@ -505,8 +609,14 @@ class DoclingFigureCaptionLinker:
                 used_caption_refs.update(direct.refs)
                 continue
 
-            # New behavior: even if Docling direct link exists, still search best caption cluster.
-            best = self._best_caption_candidate(fig, caption_clusters, used_caption_refs, figures)
+            best = self._best_caption_candidate(
+                fig=fig,
+                caption_clusters=caption_clusters,
+                used_caption_refs=used_caption_refs,
+                all_figures=figures,
+                direct_caption=direct if self.config.direct_link_policy == "boost" else None,
+            )
+
             if best is None:
                 results.append(
                     CaptionAssociation(
@@ -539,6 +649,116 @@ class DoclingFigureCaptionLinker:
 
         return results
 
+    def _link_page_panel(
+        self,
+        page_no: int,
+        figures: Sequence[PageFigure],
+        caption_clusters: Sequence[CaptionCluster],
+    ) -> List[CaptionAssociation]:
+        """Page-level greedy assignment for panel/directional pages."""
+
+        cfg = self.config
+        results: List[CaptionAssociation] = []
+        used_caption_refs: set[str] = set()
+        assigned_figs: set[str] = set()
+
+        # Hard trust mode keeps Docling's direct links fixed.
+        if cfg.direct_link_policy == "trust":
+            for fig in figures:
+                direct = self._direct_caption_for_figure(fig.raw, caption_clusters)
+                if direct is None:
+                    continue
+                results.append(
+                    CaptionAssociation(
+                        figure_ref=fig.ref,
+                        page_no=page_no,
+                        figure_bbox=fig.bbox,
+                        caption_ref=direct.refs[0] if len(direct.refs) == 1 else " | ".join(direct.refs),
+                        caption_text=direct.text,
+                        caption_bbox=direct.bbox,
+                        source="docling_direct",
+                        score=cfg.direct_caption_bonus,
+                    )
+                )
+                assigned_figs.add(fig.ref)
+                used_caption_refs.update(direct.refs)
+
+        candidates: List[Tuple[float, str, CaptionCluster, str]] = []
+        directions = ("below", "above", "left", "right")
+
+        for fig in figures:
+            if fig.ref in assigned_figs:
+                continue
+
+            direct = self._direct_caption_for_figure(fig.raw, caption_clusters)
+            direct_refs = set(direct.refs) if direct is not None else set()
+
+            for cap in caption_clusters:
+                if any(r in used_caption_refs for r in cap.refs):
+                    continue
+
+                candidate_dirs: Sequence[str]
+                if cap.is_directional and cap.direction_hint in _DIRECTION_TO_CAPTION_RELATION:
+                    candidate_dirs = (_DIRECTION_TO_CAPTION_RELATION[cap.direction_hint],)
+                else:
+                    candidate_dirs = directions
+
+                for direction in candidate_dirs:
+                    score = self._pair_score(fig, cap, direction)
+                    if score <= 0:
+                        continue
+
+                    if direct is not None and cfg.direct_link_policy == "boost" and any(r in direct_refs for r in cap.refs):
+                        score += cfg.direct_caption_bonus
+
+                    if cap.is_directional:
+                        score += self._directional_caption_bonus(cap, direction)
+
+                    candidates.append((score, fig.ref, cap, direction))
+
+        candidates.sort(key=lambda x: (x[0], -self._gap_for_direction_by_ref(x[2].bbox, x[1], x[3])), reverse=True)
+
+        for score, fig_ref, cap, direction in candidates:
+            if fig_ref in assigned_figs:
+                continue
+            if any(r in used_caption_refs for r in cap.refs):
+                continue
+
+            fig = next(f for f in figures if f.ref == fig_ref)
+            results.append(
+                CaptionAssociation(
+                    figure_ref=fig.ref,
+                    page_no=page_no,
+                    figure_bbox=fig.bbox,
+                    caption_ref=cap.refs[0] if len(cap.refs) == 1 else " | ".join(cap.refs),
+                    caption_text=cap.text,
+                    caption_bbox=cap.bbox,
+                    source=f"panel_{direction}",
+                    score=score,
+                )
+            )
+            assigned_figs.add(fig_ref)
+            used_caption_refs.update(cap.refs)
+
+        # Unmatched figures.
+        for fig in figures:
+            if fig.ref in assigned_figs:
+                continue
+            results.append(
+                CaptionAssociation(
+                    figure_ref=fig.ref,
+                    page_no=page_no,
+                    figure_bbox=fig.bbox,
+                    caption_ref=None,
+                    caption_text=None,
+                    caption_bbox=None,
+                    source="unmatched",
+                    score=0.0,
+                )
+            )
+
+        return results
+
     def _direct_caption_for_figure(
         self,
         picture_obj: Any,
@@ -548,13 +768,11 @@ class DoclingFigureCaptionLinker:
 
         direct_refs: List[str] = []
 
-        # Prefer captions[] when populated.
         for ref_item in (getattr(picture_obj, "captions", None) or []):
             cref = getattr(ref_item, "cref", None)
             if cref:
                 direct_refs.append(str(cref))
 
-        # Fall back to child text refs that are caption-like.
         for ref_item in (getattr(picture_obj, "children", None) or []):
             cref = getattr(ref_item, "cref", None)
             if cref:
@@ -563,7 +781,6 @@ class DoclingFigureCaptionLinker:
         if not direct_refs:
             return None
 
-        # Match any cluster that contains one of these refs.
         direct_set = set(direct_refs)
         for cluster in caption_clusters:
             if any(ref in direct_set for ref in cluster.refs):
@@ -580,17 +797,21 @@ class DoclingFigureCaptionLinker:
         caption_clusters: Sequence[CaptionCluster],
         used_caption_refs: Iterable[str],
         all_figures: Sequence[PageFigure],
+        direct_caption: Optional[CaptionCluster] = None,
     ) -> Optional[Tuple[CaptionCluster, float, str]]:
         used = set(used_caption_refs)
 
-        below = self._best_in_direction(fig, caption_clusters, used, all_figures, direction="below")
-        above = self._best_in_direction(fig, caption_clusters, used, all_figures, direction="above")
+        candidates: List[Tuple[CaptionCluster, float, str]] = []
+        for direction in ("below", "above", "left", "right"):
+            best = self._best_in_direction(fig, caption_clusters, used, all_figures, direction, direct_caption)
+            if best is not None:
+                candidates.append(best)
 
-        if below is None:
-            return above
-        if above is None:
-            return below
-        return below if below[1] >= above[1] else above
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: (x[1], -self._gap_for_direction(fig.bbox, x[0].bbox, x[2])), reverse=True)
+        return candidates[0]
 
     def _best_in_direction(
         self,
@@ -599,13 +820,21 @@ class DoclingFigureCaptionLinker:
         used_caption_refs: set[str],
         all_figures: Sequence[PageFigure],
         direction: str,
+        direct_caption: Optional[CaptionCluster] = None,
     ) -> Optional[Tuple[CaptionCluster, float, str]]:
         cfg = self.config
         candidates: List[Tuple[CaptionCluster, float]] = []
+        direct_refs = set(direct_caption.refs) if direct_caption is not None else set()
 
         for cap in caption_clusters:
             if any(r in used_caption_refs for r in cap.refs):
                 continue
+
+            # Directional atoms only compete in their semantic relation.
+            if cap.is_directional and cap.direction_hint in _DIRECTION_TO_CAPTION_RELATION:
+                semantic_direction = _DIRECTION_TO_CAPTION_RELATION[cap.direction_hint]
+                if semantic_direction != direction:
+                    continue
 
             if direction == "below":
                 gap = cap.bbox.top - fig.bbox.bottom
@@ -614,15 +843,36 @@ class DoclingFigureCaptionLinker:
                 if not self._is_plausible_below(fig.bbox, cap.bbox):
                     continue
                 blocker = self._blocker_penalty(fig, cap.bbox, all_figures, direction="below")
-            else:
+            elif direction == "above":
                 gap = fig.bbox.top - cap.bbox.bottom
                 if gap < -cfg.vertical_tolerance or gap > cfg.max_above_gap:
                     continue
                 if not self._is_plausible_above(fig.bbox, cap.bbox):
                     continue
                 blocker = self._blocker_penalty(fig, cap.bbox, all_figures, direction="above")
+            elif direction == "left":
+                gap = fig.bbox.left - cap.bbox.right
+                if gap < -cfg.vertical_tolerance or gap > cfg.max_left_gap:
+                    continue
+                if not self._is_plausible_left(fig.bbox, cap.bbox):
+                    continue
+                blocker = self._blocker_penalty(fig, cap.bbox, all_figures, direction="left")
+            else:
+                gap = cap.bbox.left - fig.bbox.right
+                if gap < -cfg.vertical_tolerance or gap > cfg.max_right_gap:
+                    continue
+                if not self._is_plausible_right(fig.bbox, cap.bbox):
+                    continue
+                blocker = self._blocker_penalty(fig, cap.bbox, all_figures, direction="right")
 
-            score = self._score_candidate(fig, cap, gap=gap, direction=direction) - blocker
+            score = self._pair_score(fig, cap, direction, gap=gap) - blocker
+
+            if direct_caption is not None and any(r in direct_refs for r in cap.refs):
+                score += cfg.direct_caption_bonus
+
+            if cap.is_directional:
+                score += self._directional_caption_bonus(cap, direction)
+
             if score > 0:
                 candidates.append((cap, score))
 
@@ -633,62 +883,87 @@ class DoclingFigureCaptionLinker:
         best = candidates[0]
         return best[0], best[1], f"geometric_{direction}"
 
-    def _score_candidate(self, fig: PageFigure, cap: CaptionCluster, gap: float, direction: str) -> float:
-        """Score a figure/caption pair.
+    def _directional_caption_bonus(self, cap: CaptionCluster, direction: str) -> float:
+        if not cap.is_directional or cap.direction_hint is None:
+            return 0.0
+        semantic_direction = _DIRECTION_TO_CAPTION_RELATION.get(cap.direction_hint)
+        if semantic_direction == direction:
+            return self.config.directional_caption_bonus
+        return 0.0
+
+    def _pair_score(self, fig: PageFigure, cap: CaptionCluster, direction: str, gap: Optional[float] = None) -> float:
+        """Score a figure/caption pair for any direction.
 
         High score means a better match.
-        The score prefers:
-        - horizontal overlap or near-overlap
-        - close x-centers
-        - small vertical gap
-        - explicit caption labels
-        - captions that sit in the same visual column/lane
         """
 
         cfg = self.config
         fb = fig.bbox
         cb = cap.bbox
 
-        # Expand figure x-span to handle captions wider than the picture.
-        expand_x = max(cfg.figure_expand_x_min, cfg.figure_expand_x_ratio * fb.width)
-        expanded = fb.expand(dx=expand_x, dy=0.0)
+        if direction in {"below", "above"}:
+            expand_x = max(cfg.figure_expand_x_min, cfg.figure_expand_x_ratio * fb.width)
+            expanded = fb.expand(dx=expand_x, dy=0.0)
 
-        overlap_ratio = fb.horizontal_overlap_ratio(cb)
-        expanded_overlap = expanded.horizontal_overlap_ratio(cb)
-        center_dx = abs(fb.cx - cb.cx)
-        center_dx_ratio = center_dx / max(1e-9, max(fb.width, cb.width))
+            overlap_ratio = fb.horizontal_overlap_ratio(cb)
+            expanded_overlap = expanded.horizontal_overlap_ratio(cb)
+            center_dx = abs(fb.cx - cb.cx)
+            center_dx_ratio = center_dx / max(1e-9, max(fb.width, cb.width))
 
-        gap_limit = cfg.max_below_gap if direction == "below" else cfg.max_above_gap
-        gap_term = max(0.0, 1.0 - min(1.0, gap / max(1e-9, gap_limit)))
+            if gap is None:
+                gap = self._gap_for_direction(fb, cb, direction)
+            gap_limit = cfg.max_below_gap if direction == "below" else cfg.max_above_gap
+            gap_term = max(0.0, 1.0 - min(1.0, gap / max(1e-9, gap_limit)))
 
-        score = 0.0
-        score += 145.0 * min(1.0, expanded_overlap)
-        score += 90.0 * min(1.0, overlap_ratio)
-        score += 55.0 * max(0.0, 1.0 - min(1.0, center_dx_ratio / max(1e-9, cfg.max_center_dx_ratio)))
-        score += 24.0 * gap_term
+            score = 0.0
+            score += 145.0 * min(1.0, expanded_overlap)
+            score += 90.0 * min(1.0, overlap_ratio)
+            score += 55.0 * max(0.0, 1.0 - min(1.0, center_dx_ratio / max(1e-9, cfg.max_center_dx_ratio)))
+            score += 24.0 * gap_term
 
-        # Bonus for explicit caption labels in any merged component.
+            if expanded.left <= cb.cx <= expanded.right:
+                score += 12.0 if direction == "below" else 8.0
+
+            score += 10.0 if direction == "below" else 4.0
+
+        else:
+            expand_y = max(cfg.figure_expand_y_min, cfg.figure_expand_y_ratio * fb.height)
+            expanded = fb.expand(dx=0.0, dy=expand_y)
+
+            overlap_ratio = fb.vertical_overlap_ratio(cb)
+            expanded_overlap = expanded.vertical_overlap_ratio(cb)
+            center_dy = abs(fb.cy - cb.cy)
+            center_dy_ratio = center_dy / max(1e-9, max(fb.height, cb.height))
+
+            if gap is None:
+                gap = self._gap_for_direction(fb, cb, direction)
+            gap_limit = cfg.max_left_gap if direction == "left" else cfg.max_right_gap
+            gap_term = max(0.0, 1.0 - min(1.0, gap / max(1e-9, gap_limit)))
+
+            score = 0.0
+            score += 145.0 * min(1.0, expanded_overlap)
+            score += 90.0 * min(1.0, overlap_ratio)
+            score += 55.0 * max(0.0, 1.0 - min(1.0, center_dy_ratio / max(1e-9, cfg.max_center_dy_ratio)))
+            score += 24.0 * gap_term
+
+            if expanded.top <= cb.cy <= expanded.bottom:
+                score += 12.0 if direction == "right" else 8.0
+
+            score += 10.0 if direction == "right" else 4.0
+
         if cap.is_explicit_caption:
             score += cfg.caption_label_bonus
 
-        # Small penalty for very long captions.
-        score -= cfg.long_caption_penalty_per_200_chars * (len(cap.text.strip()) / 200.0)
-
-        # Direction bias. Captions are more often below than above.
-        if direction == "below":
-            score += 10.0
+        if cap.is_directional:
+            score += 0.0  # handled separately through semantic bonus
         else:
-            score += 4.0
+            # Slight preference against generic body-like text when competing with a real caption.
+            score -= 8.0
 
-        # Extra reward if the caption sits inside the x-band of the expanded figure.
-        if expanded.left <= cb.cx <= expanded.right:
-            score += 12.0 if direction == "below" else 8.0
-
+        score -= cfg.long_caption_penalty_per_200_chars * (len(cap.text.strip()) / 200.0)
         return score
 
     def _is_plausible_below(self, fig: Rect, cap: Rect) -> bool:
-        """Quick geometry gate for a below-caption candidate."""
-
         cfg = self.config
         expand_x = max(cfg.figure_expand_x_min, cfg.figure_expand_x_ratio * fig.width)
         expanded = fig.expand(dx=expand_x, dy=0.0)
@@ -709,8 +984,6 @@ class DoclingFigureCaptionLinker:
         return False
 
     def _is_plausible_above(self, fig: Rect, cap: Rect) -> bool:
-        """Quick geometry gate for an above-caption candidate."""
-
         cfg = self.config
         expand_x = max(cfg.figure_expand_x_min, cfg.figure_expand_x_ratio * fig.width)
         expanded = fig.expand(dx=expand_x, dy=0.0)
@@ -730,10 +1003,61 @@ class DoclingFigureCaptionLinker:
 
         return False
 
+    def _is_plausible_left(self, fig: Rect, cap: Rect) -> bool:
+        cfg = self.config
+        expand_y = max(cfg.figure_expand_y_min, cfg.figure_expand_y_ratio * fig.height)
+        expanded = fig.expand(dx=0.0, dy=expand_y)
+
+        if cap.right > fig.left + cfg.vertical_tolerance:
+            return False
+
+        overlap_ratio = fig.vertical_overlap_ratio(cap)
+        if overlap_ratio >= cfg.min_vertical_overlap_ratio:
+            return True
+
+        if expanded.contains_y(cap.cy):
+            return True
+
+        if cap.contains_y(fig.cy):
+            return True
+
+        return False
+
+    def _is_plausible_right(self, fig: Rect, cap: Rect) -> bool:
+        cfg = self.config
+        expand_y = max(cfg.figure_expand_y_min, cfg.figure_expand_y_ratio * fig.height)
+        expanded = fig.expand(dx=0.0, dy=expand_y)
+
+        if cap.left < fig.right - cfg.vertical_tolerance:
+            return False
+
+        overlap_ratio = fig.vertical_overlap_ratio(cap)
+        if overlap_ratio >= cfg.min_vertical_overlap_ratio:
+            return True
+
+        if expanded.contains_y(cap.cy):
+            return True
+
+        if cap.contains_y(fig.cy):
+            return True
+
+        return False
+
     def _gap_for_direction(self, fig: Rect, cap: Rect, direction: str) -> float:
         if direction == "below":
             return max(0.0, cap.top - fig.bottom)
-        return max(0.0, fig.top - cap.bottom)
+        if direction == "above":
+            return max(0.0, fig.top - cap.bottom)
+        if direction == "left":
+            return max(0.0, fig.left - cap.right)
+        return max(0.0, cap.left - fig.right)
+
+    def _gap_for_direction_by_ref(self, cap: Rect, fig_ref: str, direction: str) -> float:
+        # Helper used only for stable tie-breaking when sorting candidate tuples.
+        # The caller already owns the figure object, so this is only a fallback.
+        if direction in {"below", "above"}:
+            return cap.top if direction == "below" else cap.bottom
+        return cap.left if direction == "right" else cap.right
 
     def _blocker_penalty(self, fig: PageFigure, cap: Rect, all_figures: Sequence[PageFigure], direction: str) -> float:
         """Penalize a candidate if another figure lies between figure and caption."""
@@ -741,22 +1065,31 @@ class DoclingFigureCaptionLinker:
         fb = fig.bbox
         if direction == "below":
             y1, y2 = fb.bottom, cap.top
-        else:
+            if y2 <= y1:
+                return 0.0
+            corridor = Rect(left=min(fb.left, cap.left), top=y1, right=max(fb.right, cap.right), bottom=y2)
+        elif direction == "above":
             y1, y2 = cap.bottom, fb.top
+            if y2 <= y1:
+                return 0.0
+            corridor = Rect(left=min(fb.left, cap.left), top=y1, right=max(fb.right, cap.right), bottom=y2)
+        elif direction == "left":
+            x1, x2 = cap.right, fb.left
+            if x2 <= x1:
+                return 0.0
+            corridor = Rect(left=x1, top=min(fb.top, cap.top), right=x2, bottom=max(fb.bottom, cap.bottom))
+        else:
+            x1, x2 = fb.right, cap.left
+            if x2 <= x1:
+                return 0.0
+            corridor = Rect(left=x1, top=min(fb.top, cap.top), right=x2, bottom=max(fb.bottom, cap.bottom))
 
-        if y2 <= y1:
-            return 0.0
-
-        corridor = Rect(left=min(fb.left, cap.left), top=y1, right=max(fb.right, cap.right), bottom=y2)
         penalty = 0.0
-
         for other in all_figures:
             if other.ref == fig.ref:
                 continue
             ob = other.bbox
-            if ob.bottom <= y1 or ob.top >= y2:
-                continue
-            if ob.x_overlap(corridor) <= 0:
+            if ob.x_overlap(corridor) <= 0 or ob.y_overlap(corridor) <= 0:
                 continue
             penalty += self.config.blocker_penalty
 
@@ -798,223 +1131,6 @@ def link_figures_to_captions(doc: Any, config: Optional[LinkerConfig] = None) ->
 
     return DoclingFigureCaptionLinker(config=config).link(doc)
 
-# =============================================================================
-def render_picture(
-        picitem: PictureItem, 
-        pdf: fitz.Document,
-        zoom:int = 2
-    ) -> fitz.Pixmap:
-    """
-    Render a cropped image from a PDF page based on a Docling PictureItem.
-    This function extracts the region of a PDF corresponding to the bounding box stored in a PictureItem 
-    and renders it as a raster image.
-    Args:
-        picitem (PictureItem):
-            A Docling PictureItem containing provenance data with page number and bounding box coordinates.
-        pdf (fitz.Document):
-            An open PyMuPDF PDF document.
-        zoom (int, optional):
-            Scaling factor for rendering resolution. Default is 2.0.
-    Returns:
-        fitz.Pixmap:
-            A rasterized image (Pixmap) of the clipped region.
-    """
-    # Convert 1-based page number → 0-based
-    page_no = picitem.prov[0].page_no - 1
-    page = pdf[page_no]
-    
-    bbox = picitem.prov[0].bbox
-    page_height = page.rect.height
-
-    # Coordinate transform (BOTTOMLEFT → TOPLEFT)
-    x0 = bbox.l
-    x1 = bbox.r
-    y0 = page_height - bbox.t
-    y1 = page_height - bbox.b
-
-    rect = fitz.Rect(x0, y0, x1, y1)
-
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, clip=rect)
-
-    return pix
-
-def get_caption(picitem, docdict):
-    texts = []
-    for child in picitem.children:
-        idx = int(child.cref.split('/')[-1])
-        # texts.append(docdict['texts'][idx]['text'])  # TypeError: 'TextItem' object is not subscriptable
-        texts.append(docdict['texts'][idx].text)
-    return " ".join(texts)
-
-def export_page_figures(
-    doc,
-    pdf: fitz.Document,
-    page_no: int,
-    output_dir: str = "figure_exports",
-    zoom: int = 2,
-    mode: Literal["display", "save", "both"] = "display",
-    show_caption: bool = True,
-    save_caption_txt: bool = True,
-    config: Optional[LinkerConfig] = None,
-    ) -> None:
-    """
-    Display and/or save figures with captions from a specific PDF page.
-
-    Figures are rendered from the source PDF using Docling picture
-    provenance metadata. Captions are resolved using the figure-caption
-    linker output.
-
-    Args:
-        doc:
-            Parsed Docling document.
-
-        pdf (fitz.Document):
-            Open PyMuPDF document.
-
-        page_no (int):
-            1-based page number to process.
-
-        output_dir (str, optional):
-            Directory used when saving outputs.
-
-        zoom (int, optional):
-            Rendering scale factor.
-
-        mode (Literal["display", "save", "both"], optional):
-            Output behavior:
-            - "display": show inline in notebook
-            - "save": save to disk
-            - "both": display and save
-
-        show_caption (bool, optional):
-            Print captions during display.
-
-        save_caption_txt (bool, optional):
-            Save captions as `.txt` files in save mode.
-
-    Returns:
-        None
-    """
-
-    # ---------------------------------------------------------
-    # Prepare output directory if saving is enabled
-    # ---------------------------------------------------------
-
-    save_enabled = mode in {"save", "both"}
-    display_enabled = mode in {"display", "both"}
-
-    output_path = Path(output_dir)
-
-    if save_enabled:
-        output_path.mkdir(parents=True, exist_ok=True)
-
-    # ---------------------------------------------------------
-    # Figure-caption associations
-    # ---------------------------------------------------------
-
-    associations = extract_figure_caption_map(doc, config=config)
-
-    assoc_map = {
-        row["figure_ref"]: row
-        for row in associations
-    }
-
-    exported_count = 0
-
-    # ---------------------------------------------------------
-    # Iterate figures
-    # ---------------------------------------------------------
-
-    for picitem in doc.pictures:
-
-        if not picitem.prov:
-            continue
-
-        pic_page = picitem.prov[0].page_no
-
-        if pic_page != page_no:
-            continue
-
-        fig_ref = str(picitem.self_ref)
-
-        # -----------------------------------------------------
-        # Render image
-        # -----------------------------------------------------
-
-        pix = render_picture(
-            picitem=picitem,
-            pdf=pdf,
-            zoom=zoom,
-        )
-
-        # -----------------------------------------------------
-        # Lookup caption
-        # -----------------------------------------------------
-
-        assoc = assoc_map.get(fig_ref, {})
-
-        caption = assoc.get("caption_text")
-
-        if not caption:
-            caption = "[No caption found]"
-
-        # -----------------------------------------------------
-        # DISPLAY MODE
-        # -----------------------------------------------------
-
-        if display_enabled:
-
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-
-            if "ipykernel" in sys.modules:
-                display(img)      # notebook
-            else:
-                img.show()        # normal .py script
-
-            print(f"Figure Ref : {fig_ref}")
-
-            if show_caption:
-                print(f"Caption    : {caption}")
-
-            print()
-
-        # -----------------------------------------------------
-        # SAVE MODE
-        # -----------------------------------------------------
-
-        if save_enabled:
-
-            image_filename = (
-                f"page_{page_no}_figure_{exported_count:04d}.png"
-            )
-
-            image_path = output_path / image_filename
-
-            pix.save(str(image_path))
-
-            print(f"Saved image: {image_path}")
-
-            if save_caption_txt:
-
-                txt_filename = (
-                    f"page_{page_no}_figure_{exported_count:04d}.txt"
-                )
-
-                txt_path = output_path / txt_filename
-
-                with open(txt_path, "w", encoding="utf-8") as f:
-                    f.write(caption)
-
-                print(f"Saved text : {txt_path}")
-
-            print()
-
-        exported_count += 1
-
-    print(f"Processed {exported_count} figure(s) from page {page_no}.")
-
-# =============================================================================
 
 def extract_figure_caption_map(doc: Any, config: Optional[LinkerConfig] = None) -> List[Dict[str, Any]]:
     """Convenience wrapper that returns JSON-friendly dictionaries."""
@@ -1024,89 +1140,160 @@ def extract_figure_caption_map(doc: Any, config: Optional[LinkerConfig] = None) 
 
 
 # =============================================================================
+# PDF rendering helpers
+# =============================================================================
+
+
+def render_picture(picitem: Any, pdf: fitz.Document, zoom: int = 2) -> fitz.Pixmap:
+    """Render a cropped image from a PDF page based on a Docling PictureItem."""
+
+    page_no = picitem.prov[0].page_no - 1  # Convert 1-based page number -> 0-based
+    page = pdf[page_no]
+
+    bbox = picitem.prov[0].bbox
+    page_height = page.rect.height
+
+    # Coordinate transform (BOTTOMLEFT -> TOPLEFT)
+    x0 = bbox.l
+    x1 = bbox.r
+    y0 = page_height - bbox.t
+    y1 = page_height - bbox.b
+
+    rect = fitz.Rect(x0, y0, x1, y1)
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, clip=rect)
+    return pix
+
+
+def get_caption(picitem: Any, docdict: Any) -> str:
+    texts = []
+    for child in picitem.children:
+        idx = int(child.cref.split("/")[-1])
+        texts.append(docdict["texts"][idx].text)
+    return " ".join(texts)
+
+
+def export_page_figures(
+    doc: Any,
+    pdf: fitz.Document,
+    page_no: int,
+    output_dir: str = "figure_exports",
+    zoom: int = 2,
+    mode: Literal["display", "save", "both"] = "display",
+    show_caption: bool = True,
+    save_caption_txt: bool = True,
+    config: Optional[LinkerConfig] = None,
+) -> None:
+    """Display and/or save figures with captions from a specific PDF page."""
+
+    save_enabled = mode in {"save", "both"}
+    display_enabled = mode in {"display", "both"}
+    output_path = Path(output_dir)
+
+    if save_enabled:
+        output_path.mkdir(parents=True, exist_ok=True)
+
+    associations = extract_figure_caption_map(doc, config=config)
+    assoc_map = {row["figure_ref"]: row for row in associations}
+
+    exported_count = 0
+
+    for picitem in doc.pictures:
+        if not picitem.prov:
+            continue
+
+        pic_page = picitem.prov[0].page_no
+        if pic_page != page_no:
+            continue
+
+        fig_ref = str(picitem.self_ref)
+
+        pix = render_picture(picitem=picitem, pdf=pdf, zoom=zoom)
+
+        assoc = assoc_map.get(fig_ref, {})
+        caption = assoc.get("caption_text") or "[No caption found]"
+
+        if display_enabled:
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            if "ipykernel" in sys.modules:
+                display(img)
+            else:
+                img.show()
+
+            print(f"Figure Ref : {fig_ref}")
+            if show_caption:
+                print(f"Caption    : {caption}")
+            print()
+
+        if save_enabled:
+            image_filename = f"page_{page_no}_figure_{exported_count:04d}.png"
+            image_path = output_path / image_filename
+            pix.save(str(image_path))
+            print(f"Saved image: {image_path}")
+
+            if save_caption_txt:
+                txt_filename = f"page_{page_no}_figure_{exported_count:04d}.txt"
+                txt_path = output_path / txt_filename
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(caption)
+                print(f"Saved text : {txt_path}")
+
+            print()
+
+        exported_count += 1
+
+    print(f"Processed {exported_count} figure(s) from page {page_no}.")
+
+
+# =============================================================================
 # Example usage
 # =============================================================================
 
 # if __name__ == "__main__":
-#     # Example only.
-#     #
 #     from docling.document_converter import DocumentConverter
-
 #     data_folder_path = Path("/mnt/c/Users/Rakesh-PC/Documents/1_GitHubSync_SSH/iid-platform/sample_data/named")
 #     file_path = data_folder_path / "govt-food-data-report-large-table-heavy.pdf"
-
 #     converter = DocumentConverter()
 #     result = converter.convert(file_path)
 #     doc = result.document
-#     #
 #     pairs = extract_figure_caption_map(doc)
 #     for row in pairs:
 #         print(row)
-#     pass
 
-# ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-
-    import time
-    import fitz
-
     from docling.document_converter import DocumentConverter
 
     data_folder_path = Path(
         "/mnt/c/Users/Rakesh-PC/Documents/1_GitHubSync_SSH/iid-platform/sample_data/named"
     )
 
-    # file_path = data_folder_path / "govt-food-data-report-large-table-heavy.pdf"
     file_path = data_folder_path / "nature-alberta-spring-2026-magazine-medium-mix-multi-col-text.pdf"
 
-    # =========================================================
-    # TOTAL TIMER
-    # =========================================================
     total_start = time.perf_counter()
-
-    # =========================================================
-    # DOCUMENT CONVERSION TIMER
-    # =========================================================
     convert_start = time.perf_counter()
 
     converter = DocumentConverter()
     result = converter.convert(file_path)
-
     doc = result.document
 
     convert_end = time.perf_counter()
+    print(f"\nDocument conversion took: {convert_end - convert_start:.2f} seconds")
 
-    print(f"\nDocument conversion took: "
-          f"{convert_end - convert_start:.2f} seconds")
-
-    # =========================================================
-    # OPEN PDF
-    # =========================================================
     fitz_pdf = fitz.open(file_path)
 
-    # =========================================================
-    # FIGURE + CAPTION EXPORT TIMER
-    # =========================================================
     export_start = time.perf_counter()
-
     export_page_figures(
         doc,
         fitz_pdf,
         page_no=10,
         zoom=3,
         mode="display",
+        config=LinkerConfig(direct_link_policy="boost"),
     )
-
     export_end = time.perf_counter()
 
-    print(f"\nFigure/caption export took: "
-          f"{export_end - export_start:.2f} seconds")
+    print(f"\nFigure/caption export took: {export_end - export_start:.2f} seconds")
 
-    # =========================================================
-    # TOTAL TIME
-    # =========================================================
     total_end = time.perf_counter()
-
-    print(f"\nTOTAL PIPELINE TIME: "
-          f"{total_end - total_start:.2f} seconds")
+    print(f"\nTOTAL PIPELINE TIME: {total_end - total_start:.2f} seconds")
