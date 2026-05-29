@@ -9,3 +9,18 @@ __pycache__/
 *.temp/
 *temp.json
 *exports_page_*/
+*.*temp*/
+
+# 
+*.log
+
+# Environment files
+*.env
+*.venv
+*.*env
+
+# Database files
+*.sqlite
+*.db
+__pycache__/
+*.pyc
